@@ -447,6 +447,7 @@ class _BaseAutoModelClass:
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         config = kwargs.pop("config", None)
+        frozen_number = kwargs['frozen_number'] if 'frozen_number' in kwargs else None
         trust_remote_code = kwargs.pop("trust_remote_code", None)
         kwargs["_from_auto"] = True
         hub_kwargs_names = [

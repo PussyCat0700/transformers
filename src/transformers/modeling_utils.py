@@ -137,6 +137,12 @@ logger = logging.get_logger(__name__)
 
 _init_weights = True
 
+def load_checkpoint(model, optimizer, ckpt_path):
+    checkpoint = torch.load(ckpt_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['step']
 
 def is_fsdp_enabled():
     return (
@@ -3467,6 +3473,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         adapter_name = kwargs.pop("adapter_name", "default")
         use_flash_attention_2 = kwargs.pop("use_flash_attention_2", False)
         generation_config = kwargs.pop("generation_config", None)
+        vae_model = kwargs['vae_model']
+        # import pdb; pdb.set_trace()
 
         gguf_file = kwargs.pop("gguf_file", None)
         # Cache path to the GGUF file
@@ -4094,6 +4102,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
 
         with ContextManagers(init_contexts):
             # Let's make sure we don't run the init function of buffer modules
+            # import pdb; pdb.set_trace()
             model = cls(config, *model_args, **model_kwargs)
 
         # make sure we use the model's config since the __init__ call might have copied it
@@ -4244,7 +4253,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
 
         # make sure token embedding weights are still tied if needed
         model.tie_weights()
-
+        # import pdb; pdb.set_trace()
+        load_checkpoint(model.transformer.vqvae, None, vae_model['vae_pretrained_model_path'])
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.eval()
 
