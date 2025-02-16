@@ -64,82 +64,6 @@ _CHECKPOINT_FOR_DOC = "openai-community/gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-from vector_quantize_pytorch import VectorQuantize, ResidualVQ, GroupedResidualVQ, RandomProjectionQuantizer, SimVQ, ResidualSimVQ, LFQ
-from utils import load_config
-
-def load_checkpoint(model, optimizer, ckpt_path):
-    checkpoint = torch.load(ckpt_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['step']
-
-def get_model(vae_config_path):
-    vae_config = load_config(vae_config_path)
-
-    if vae_config['vq_type'] == 'VectorQuantize': 
-        vqvae = VectorQuantize(
-            dim=vae_config['embedding_dim'],
-            codebook_dim=vae_config['codebook_dim'],
-            codebook_size=vae_config['codebook_size'],
-            decay=0.8,
-            commitment_weight=1.,
-            kmeans_init=True,
-            rotation_trick=True,
-            straight_through=False,
-        )
-    elif vae_config['vq_type'] == 'ResidualVQ':
-        vqvae = ResidualVQ(
-            dim = vae_config['embedding_dim'],
-            codebook_dim=vae_config['codebook_dim'],
-            num_quantizers = vae_config['num_quantizers'],      # specify number of quantizers
-            codebook_size = vae_config['codebook_size'],    # codebook size
-        )
-    elif vae_config['vq_type'] == 'GroupedResidualVQ':  
-        vqvae = GroupedResidualVQ(
-            dim = vae_config['embedding_dim'],
-            num_quantizers = vae_config['num_quantizers'] // vae_config['num_groups'],      # specify number of quantizers
-            groups = vae_config['num_groups'],
-            codebook_size = vae_config['codebook_size'],    # codebook size
-        )
-    elif vae_config['vq_type'] == 'RandomProjectionQuantizer':  
-        vqvae = RandomProjectionQuantizer(
-            dim = vae_config['embedding_dim'],               # input dimensions
-            num_codebooks = vae_config['num_quantizers'],      # in USM, they used up to 16 for 5% gain
-            codebook_dim = vae_config['codebook_dim'],      # codebook dimension
-            codebook_size = vae_config['codebook_size']     # codebook size
-        )
-    elif vae_config['vq_type'] == 'SimVQ': 
-        vqvae = SimVQ(
-            dim = vae_config['embedding_dim'],
-            codebook_size = vae_config['codebook_size'],
-            rotation_trick = True  # use rotation trick from Fifty et al.
-        )
-    elif vae_config['vq_type'] == 'ResidualSimVQ': 
-        vqvae = ResidualSimVQ(
-            dim = vae_config['embedding_dim'],
-            num_quantizers = vae_config['num_quantizers'],
-            codebook_size = vae_config['codebook_size'],
-            rotation_trick = True  # use rotation trick from Fifty et al.
-        )
-    elif vae_config['vq_type'] == 'LFQ': 
-        vqvae = LFQ(
-            codebook_size = vae_config['codebook_size'],      # codebook size, must be a power of 2
-            dim = vae_config['embedding_dim'],                   # this is the input feature dimension, defaults to log2(codebook_size) if not defined
-            entropy_loss_weight = 0.1,  # how much weight to place on entropy loss
-            diversity_gamma = 1.        # within entropy loss, how much weight to give to diversity of codes, taken from https://arxiv.org/abs/1911.05894
-        )
-
-    return vqvae
-
-
-
-
 def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     """Load tf checkpoints in a pytorch model"""
     try:
@@ -197,12 +121,10 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 
 
 class GPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None, chunk_size=None):
+    def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         self.config = config
-        self.chunk_size = chunk_size
         max_positions = config.max_position_embeddings
-        self.max_positions = max_positions
         self.register_buffer(
             "bias",
             torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)).view(
@@ -243,37 +165,6 @@ class GPT2Attention(nn.Module):
 
         self.pruned_heads = set()
 
-        mask = torch.tril(torch.ones(max_positions, max_positions))
-
-        attention_mask = mask.masked_fill(mask == 0, float('-inf')) -1
-        self.base_attn_mask = attention_mask
-
-        mask = torch.tril(torch.ones(int(max_positions // self.chunk_size), int(max_positions // self.chunk_size)))
-
-        attention_mask = mask.masked_fill(mask == 0, float('-inf')) -1
-        self.ctx_attn_mask = attention_mask
-        self.ctx_pred_attn_mask = self.ctx_token_attention_mask(int(max_positions // self.chunk_size) + max_positions, self.chunk_size+1, self.chunk_size+1)
-        # import pdb; pdb.set_trace()
-    def ctx_token_attention_mask(self, seq_len, window_size, window_position):
-        
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len))
-        mask = torch.zeros(seq_len, seq_len)
-        # 处理每个 window 的额外规则
-        for start in range(0, seq_len, window_size):
-            end = min(start + window_size, seq_len)
-            
-            # 当前 window 内的 tokens 可以看到自己窗口内的所有 tokens
-            mask[start:end, start:end] = 1
-            
-            # 如果不是第一个 window，那么每个 window 的第一个 token 可以看到前一个 window 的第一个 token
-            for prev_start in range(0, start, window_size):
-                mask[start:end, prev_start] = 1
-        mask *= causal_mask
-        # import pdb; pdb.set_trace()
-        mask = mask.masked_fill(mask == 0, float('-inf')) -1
-        # mask = torch.zeros_like(causal_mask)
-        return mask
-
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
@@ -291,29 +182,29 @@ class GPT2Attention(nn.Module):
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
-        
+
         if self.scale_attn_weights:
             attn_weights = attn_weights / torch.full(
                 [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
             )
-        # import pdb; pdb.set_trace()
+
         # Layer-wise attention scaling
         if self.scale_attn_by_inverse_layer_idx:
             attn_weights = attn_weights / float(self.layer_idx + 1)
 
+        if not self.is_cross_attention:
+            # if only "normal" attention layer implements causal mask
+            query_length, key_length = query.size(-2), key.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            mask_value = torch.finfo(attn_weights.dtype).min
+            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+            mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
         if attention_mask is not None:
             # Apply the attention mask
-            # import pdb; pdb.set_trace()
-            if attn_weights.shape[-1] == self.max_positions:
-                attn_weights = attn_weights + self.base_attn_mask.to(attn_weights.device)
-                
-            elif attn_weights.shape[-1] == int(self.max_positions // self.chunk_size):
-                attn_weights = attn_weights + self.ctx_attn_mask.to(attn_weights.device)
-                
-            elif attn_weights.shape[-1] == self.max_positions + int(self.max_positions // self.chunk_size):
-                attn_weights = attn_weights + self.ctx_pred_attn_mask.to(attn_weights.device)
-            
+            attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -360,23 +251,16 @@ class GPT2Attention(nn.Module):
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
             mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-        # import pdb; pdb.set_trace()
+
         if attention_mask is not None:
             # Apply the attention mask
-            
-            if attn_weights.shape[-1] == self.max_positions:
-                attn_weights = attn_weights + self.base_attn_mask.to(attn_weights.device)
-                
-            elif attn_weights.shape[-1] == int(self.max_positions // self.chunk_size):
-                attn_weights = attn_weights + self.ctx_attn_mask.to(attn_weights.device)
-                
-            elif attn_weights.shape[-1] == self.max_positions + int(self.max_positions // self.chunk_size):
-                attn_weights = attn_weights + self.ctx_pred_attn_mask.to(attn_weights.device)
-                
+            attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op if otherwise
+        if attn_weights.dtype != torch.float32:
+            raise RuntimeError("Error with upcasting, attn_weights does not have dtype torch.float32")
         attn_weights = attn_weights.type(value.dtype)
         attn_weights = self.attn_dropout(attn_weights)
 
@@ -441,7 +325,7 @@ class GPT2Attention(nn.Module):
             present = (key, value)
         else:
             present = None
-        # import pdb; pdb.set_trace()
+
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
         else:
@@ -699,15 +583,14 @@ GPT2_ATTENTION_CLASSES = {"eager": GPT2Attention, "flash_attention_2": GPT2Flash
 
 
 class GPT2Block(nn.Module):
-    def __init__(self, config, layer_idx=None, chunk_size=None):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
-        # import pdb; pdb.set_trace()
-        attention_class = GPT2_ATTENTION_CLASSES['eager']
+        attention_class = GPT2_ATTENTION_CLASSES[config._attn_implementation]
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = attention_class(config=config, layer_idx=layer_idx, chunk_size=chunk_size)
+        self.attn = attention_class(config=config, layer_idx=layer_idx)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
@@ -728,7 +611,6 @@ class GPT2Block(nn.Module):
         output_attentions: Optional[bool] = False,
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
-        # import pdb; pdb.set_trace()
         hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
             hidden_states,
@@ -743,6 +625,27 @@ class GPT2Block(nn.Module):
         # residual connection
         hidden_states = attn_output + residual
 
+        if encoder_hidden_states is not None:
+            # add one self-attention block for cross-attention
+            if not hasattr(self, "crossattention"):
+                raise ValueError(
+                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with "
+                    "cross-attention layers by setting `config.add_cross_attention=True`"
+                )
+            residual = hidden_states
+            hidden_states = self.ln_cross_attn(hidden_states)
+            cross_attn_outputs = self.crossattention(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+            )
+            attn_output = cross_attn_outputs[0]
+            # residual connection
+            hidden_states = residual + attn_output
+            outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -989,38 +892,26 @@ DEPARALLELIZE_DOCSTRING = r"""
 class GPT2Model(GPT2PreTrainedModel):
     _supports_param_buffer_assignment = False
 
-    def __init__(self, config, input_layers=None, vqvae=None, ctx_layers=None, vae_model=None, chunk_size=None):
+    def __init__(self, config):
         super().__init__(config)
-        self.input_layers = input_layers
-        self.embed_dim = config.hidden_size
-        self.ctx_layers = ctx_layers
 
-        # self.vqvae = vqvae.load_pretrained_embedding('/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyuliang-240108350135/models/init_modules/VQVAE_embedding_MLP_codebook1024.pth') if vqvae != None else None
-        self.vqvae = vqvae if vqvae != None else None
-        # self.vae_model = vae_model if vae_model != None else None
-        self.chunk_size = chunk_size
+        self.embed_dim = config.hidden_size
 
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i, chunk_size=self.chunk_size) for i in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
         self.model_parallel = False
         self.device_map = None
         self.gradient_checkpointing = False
-        self._attn_implementation = 'eager'
+        self._attn_implementation = config._attn_implementation
 
         # Initialize weights and apply final processing
         self.post_init()
-
-        self.ctx_attn_mask = torch.tensor(1)
-        
-        self.ctx_lm_head = nn.Linear(self.embed_dim, self.vqvae.codebook_size * self.vqvae.num_quantizers)
-        self.loss_fct = CrossEntropyLoss()
-
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
@@ -1085,26 +976,6 @@ class GPT2Model(GPT2PreTrainedModel):
         output_type=BaseModelOutputWithPastAndCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
-
-    def ctx_token_attention_mask(self, seq_len, window_size, window_position):
-        
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len))
-        mask = torch.zeros(seq_len, seq_len)
-        # 处理每个 window 的额外规则
-        for start in range(0, seq_len, window_size):
-            end = min(start + window_size, seq_len)
-            
-            # 当前 window 内的 tokens 可以看到自己窗口内的所有 tokens
-            mask[start:end, start:end] = 1
-            
-            # 如果不是第一个 window，那么每个 window 的第一个 token 可以看到前一个 window 的第一个 token
-            for prev_start in range(0, start, window_size):
-                mask[start:end, prev_start] = 1
-        mask *= causal_mask
-        # import pdb; pdb.set_trace()
-        return mask
-
-
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1121,15 +992,12 @@ class GPT2Model(GPT2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
-        # import pdb; pdb.set_trace()
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # import pdb; pdb.set_trace()
-        qualitized_loss = None
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -1160,9 +1028,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        # import pdb; pdb.set_trace()
         position_embeds = self.wpe(position_ids)
-        
         hidden_states = inputs_embeds + position_embeds
 
         # Attention mask.
@@ -1235,225 +1101,63 @@ class GPT2Model(GPT2PreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-        
-        
-        if self.input_layers is None:
-            
-            for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-                # Model parallel
-                
-                if self.model_parallel:
-                    torch.cuda.set_device(hidden_states.device)
-                    # Ensure layer_past is on same device as hidden_states (might not be correct)
-                    if layer_past is not None:
-                        layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
-                    # Ensure that attention_mask is always on the same device as hidden_states
-                    if attention_mask is not None:
-                        attention_mask = attention_mask.to(hidden_states.device)
-                    if isinstance(head_mask, torch.Tensor):
-                        head_mask = head_mask.to(hidden_states.device)
-                if output_hidden_states:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
+        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+            # Model parallel
+            if self.model_parallel:
+                torch.cuda.set_device(hidden_states.device)
+                # Ensure layer_past is on same device as hidden_states (might not be correct)
+                if layer_past is not None:
+                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
+                # Ensure that attention_mask is always on the same device as hidden_states
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(hidden_states.device)
+                if isinstance(head_mask, torch.Tensor):
+                    head_mask = head_mask.to(hidden_states.device)
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
-                if self.gradient_checkpointing and self.training:
-                    outputs = self._gradient_checkpointing_func(
-                        block.__call__,
-                        hidden_states,
-                        None,
-                        attention_mask,
-                        head_mask[i],
-                        encoder_hidden_states,
-                        encoder_attention_mask,
-                        use_cache,
-                        output_attentions,
-                    )
-                else:
-                    outputs = block(
-                        hidden_states,
-                        layer_past=layer_past,
-                        attention_mask=attention_mask,
-                        head_mask=head_mask[i],
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                        use_cache=use_cache,
-                        output_attentions=output_attentions,
-                    )
+            if self.gradient_checkpointing and self.training:
+                outputs = self._gradient_checkpointing_func(
+                    block.__call__,
+                    hidden_states,
+                    None,
+                    attention_mask,
+                    head_mask[i],
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    use_cache,
+                    output_attentions,
+                )
+            else:
+                outputs = block(
+                    hidden_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask[i],
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
 
-                hidden_states = outputs[0]
-                if use_cache is True:
-                    presents = presents + (outputs[1],)
+            hidden_states = outputs[0]
+            if use_cache is True:
+                presents = presents + (outputs[1],)
 
-                if output_attentions:
-                    all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
-                    if self.config.add_cross_attention:
-                        all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+                if self.config.add_cross_attention:
+                    all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
 
-                # Model Parallel: If it's the last layer for that device, put things on the next device
-                if self.model_parallel:
-                    for k, v in self.device_map.items():
-                        if i == v[-1] and "cuda:" + str(k) != self.last_device:
-                            hidden_states = hidden_states.to("cuda:" + str(k + 1))
-        else:
-            for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-                # Model parallel
-                
-                if self.model_parallel:
-                    torch.cuda.set_device(hidden_states.device)
-                    # Ensure layer_past is on same device as hidden_states (might not be correct)
-                    if layer_past is not None:
-                        layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
-                    # Ensure that attention_mask is always on the same device as hidden_states
-                    if attention_mask is not None:
-                        attention_mask = attention_mask.to(hidden_states.device)
-                    if isinstance(head_mask, torch.Tensor):
-                        head_mask = head_mask.to(hidden_states.device)
-                if output_hidden_states:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
+            # Model Parallel: If it's the last layer for that device, put things on the next device
+            if self.model_parallel:
+                for k, v in self.device_map.items():
+                    if i == v[-1] and "cuda:" + str(k) != self.last_device:
+                        hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
-                # import pdb; pdb.set_trace()
-                if i == self.input_layers:
-                    ctx_features = hidden_states
-                    
-                    batch_size, seq_len, hidden_size = hidden_states.size()
-                    num_ctx_tokens = seq_len // self.chunk_size  # ctx tokens 的数量
+        hidden_states = self.ln_f(hidden_states)
 
-                    hidden_states_reshaped = hidden_states.view(batch_size, num_ctx_tokens, self.chunk_size, hidden_size)
-                    ctx_hidden_states = hidden_states_reshaped.mean(dim=2)
-
-                    if isinstance(self.vqvae, VectorQuantize) or isinstance(self.vqvae, SimVQ) or isinstance(self.vqvae, ResidualVQ):
-                        ctx_tokens, ctx_token_ids, cmt_loss = self.vqvae(ctx_hidden_states)
-                        qualitized_loss = (ctx_tokens - ctx_hidden_states).abs().mean()
-                        qualitized_loss += cmt_loss.mean()
-
-                    if isinstance(self.vqvae, LFQ): 
-                        ctx_tokens, ctx_token_ids, entropy_aux_loss = self.vqvae(ctx_hidden_states)
-                        qualitized_loss = F.l1_loss(ctx_tokens, ctx_hidden_states)
-                        qualitized_loss += entropy_aux_loss
-                        
-                    
-                else: ctx_tokens=None
-       
-                
-                if self.gradient_checkpointing and self.training:
-                    outputs = self._gradient_checkpointing_func(
-                        block.__call__,
-                        hidden_states,
-                        None,
-                        attention_mask,
-                        head_mask[i],
-                        encoder_hidden_states,
-                        encoder_attention_mask,
-                        use_cache,
-                        output_attentions,
-                    )
-                else:
-                    if i == self.input_layers:
-                        residual_hidden_states = hidden_states
-                    # import pdb; pdb.set_trace()
-                    if i < self.input_layers:
-                        outputs = block(
-                            hidden_states,
-                            layer_past=layer_past,
-                            attention_mask=attention_mask,
-                            head_mask=head_mask[i],
-                            encoder_hidden_states=encoder_hidden_states,
-                            encoder_attention_mask=encoder_attention_mask,
-                            use_cache=use_cache,
-                            output_attentions=output_attentions,
-                        )
-                    elif self.input_layers <= i and i < self.ctx_layers:
-                        if ctx_tokens is not None:    
-                            # import pdb; pdb.set_trace()                      
-                            outputs = block(
-                                ctx_tokens,
-                                layer_past=layer_past,
-                                attention_mask=attention_mask,
-                                head_mask=head_mask[i],
-                                encoder_hidden_states=encoder_hidden_states,
-                                encoder_attention_mask=encoder_attention_mask,
-                                use_cache=use_cache,
-                                output_attentions=output_attentions,
-                            )
-                        else:
-                            outputs = block(
-                                hidden_states,
-                                layer_past=layer_past,
-                                attention_mask=attention_mask,
-                                head_mask=head_mask[i],
-                                encoder_hidden_states=encoder_hidden_states,
-                                encoder_attention_mask=encoder_attention_mask,
-                                use_cache=use_cache,
-                                output_attentions=output_attentions,
-                            )
-                        if i == self.ctx_layers - 1:
-                            # import pdb; pdb.set_trace()
-                            ctx_pred = self.ctx_lm_head(outputs[0]).view(ctx_token_ids.shape[0], ctx_token_ids.shape[1], ctx_token_ids.shape[2], self.vqvae.codebook_size)
-                            ctx_loss = self.loss_fct(ctx_pred[..., :-1, :].contiguous().view(-1, ctx_pred.size(-1)), ctx_token_ids[..., 1:].contiguous().view(-1).detach())
-
-                    else:
-                        if i == self.ctx_layers:
-                            max_indices = torch.argmax(ctx_pred, dim=-1)
-                            # max_indices = ctx_token_ids
-                            
-                            if isinstance(self.vqvae, VectorQuantize) or isinstance(self.vqvae, ResidualVQ):
-                                qualitized_states = self.vqvae.get_output_from_indices(max_indices)
-                            
-                            elif isinstance(self.vqvae, SimVQ) or isinstance(self.vqvae, LFQ):
-                                qualitized_states = self.vqvae.indices_to_codes(max_indices)
-
-
-                            qualitized_states = qualitized_states[:, :-1, :]
-                            first_states = hidden_states[:, 0:1, :]
-                            qualitized_states = torch.cat((first_states, qualitized_states), dim=1)
-
-
-                            hidden_states_res = []
-                            for i_token in range(qualitized_states.shape[1]):  # x2.shape[1] = 1024 / n
-                                hidden_states_slice = residual_hidden_states[:, i_token * self.chunk_size: (i_token + 1) * self.chunk_size]  # Slice of n elements from x1    
-                                slided_ctx_tokens = qualitized_states[:, i_token:i_token + 1]  # One token from x2                                
-                                hidden_states_res.append(torch.cat([slided_ctx_tokens, hidden_states_slice], dim=1))  # Concatenate along the second dimension
-                            # Concatenate the result list into a single tensor
-                            hidden_states = torch.cat(hidden_states_res, dim=1)
-                        outputs = block(
-                            hidden_states,
-                            layer_past=layer_past,
-                            attention_mask=self.ctx_attn_mask.to(hidden_states.device),
-                            # attention_mask=attention_mask,
-                            head_mask=head_mask[i],
-                            encoder_hidden_states=encoder_hidden_states,
-                            encoder_attention_mask=encoder_attention_mask,
-                            use_cache=use_cache,
-                            output_attentions=output_attentions,
-                        )
-
-                hidden_states = outputs[0]
-                if use_cache is True:
-                    presents = presents + (outputs[1],)
-
-                if output_attentions:
-                    all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
-                    if self.config.add_cross_attention:
-                        all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
-
-                # Model Parallel: If it's the last layer for that device, put things on the next device
-                if self.model_parallel:
-                    for k, v in self.device_map.items():
-                        if i == v[-1] and "cuda:" + str(k) != self.last_device:
-                            hidden_states = hidden_states.to("cuda:" + str(k + 1))
-        
-        # import pdb; pdb.set_trace()
-        if hidden_states.shape[1] != 1024:
-            hidden_states = hidden_states[:, torch.arange(hidden_states.size(1)) % (self.chunk_size+1) != 0, :]
-            hidden_states = self.ln_f(hidden_states)
-        else:
-            hidden_states = self.ln_f(hidden_states)
-        
-        
-        try:
-            hidden_states = hidden_states.view(output_shape)
-        except:
-            print(hidden_states.shape)
-            print(output_shape)
+        hidden_states = hidden_states.view(output_shape)
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1464,14 +1168,14 @@ class GPT2Model(GPT2PreTrainedModel):
                 for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
                 if v is not None
             )
-        # import pdb; pdb.set_trace()
+
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
-        ), qualitized_loss, ctx_loss
+        )
 
 
 @add_start_docstrings(
@@ -1484,25 +1188,9 @@ class GPT2Model(GPT2PreTrainedModel):
 class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, input_layers=None, ctx_layers=None, vae_model=None, training_type=None):
-
+    def __init__(self, config):
         super().__init__(config)
-        
-        if vae_model != None:
-            vqvae = get_model(vae_model['vae_config_path'])
-        else: vae_model = None
-        
-        self.input_layers = input_layers
-        self.ctx_layers = ctx_layers
-        self.training_type = training_type
-        self.chunk_size = vae_model['chunk_size']
-
-        # import pdb; pdb.set_trace()
-        if vae_model != None:
-            # vqvae = self.vae_model
-            self.transformer = GPT2Model(config, self.input_layers, vqvae, self.ctx_layers, vae_model=vae_model, chunk_size=self.chunk_size)
-        else:
-            self.transformer = GPT2Model(config, self.input_layers, self.ctx_layers, chunk_size=self.chunk_size)
+        self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Model parallel
@@ -1511,8 +1199,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
-
-
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
@@ -1573,8 +1259,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        input_layers: Optional[int] = None,
-        ctx_layers: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1583,8 +1267,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # import pdb; pdb.set_trace()
-        transformer_outputs, qualitized_loss, ctx_loss = self.transformer(
+
+        transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -1600,18 +1284,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             return_dict=return_dict,
         )
         hidden_states = transformer_outputs[0]
-        # import pdb; pdb.set_trace()
+
         # Set device for model parallelism
         if self.model_parallel:
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states)
-        # import pdb; pdb.set_trace()
+
         loss = None
-        # input_ids = input_ids[:-1]
-        if labels is None:
-            labels = input_ids
         if labels is not None:
             # move labels to correct device to enable model parallelism
             labels = labels.to(lm_logits.device)
@@ -1620,35 +1301,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            
-            # import pdb; pdb.set_trace()           
-
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            # except:
-                
-                # loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            gpt_loss = loss
-            
-            if self.training_type == 'full' or self.training_type == 'ours':
-                loss += qualitized_loss
-                loss += ctx_loss
 
-            elif self.training_type == 'after_input_layer_include_cb' or self.training_type == 'after_input_layer_exclude_cb':
-                loss += ctx_loss
-
-            elif self.training_type == 'except_codebook':
-                loss += ctx_loss
-
-            elif self.training_type == 'codebook':
-                loss = qualitized_loss
-            
-            elif self.training_type == 'only_ctx_layer_exclude_cb' or 'after_input_layer_include_cb':
-                loss = ctx_loss
-
-            elif self.training_type == 'only_output_layer':
-                loss = loss
-
-            # import pdb; pdb.set_trace()
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
@@ -1660,8 +1314,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
-        ), qualitized_loss, ctx_loss, gpt_loss
-
+        )
 
     @staticmethod
     def _reorder_cache(
